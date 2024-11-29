@@ -119,6 +119,8 @@ static const char * NVS_KEY = "onoff_client";
 static esp_ble_mesh_client_t onoff_client;
 static esp_ble_mesh_client_t level_client;
 static esp_ble_mesh_client_t light_client;
+static esp_ble_mesh_client_t ctl_client;
+static esp_ble_mesh_client_t hsl_client;
 
 static esp_ble_mesh_cfg_srv_t config_server = {
     .relay = ESP_BLE_MESH_RELAY_DISABLED,
@@ -142,12 +144,16 @@ static esp_ble_mesh_cfg_srv_t config_server = {
 ESP_BLE_MESH_MODEL_PUB_DEFINE(onoff_cli_pub, 2 + 1, ROLE_NODE);
 ESP_BLE_MESH_MODEL_PUB_DEFINE(level_cli_pub, 2 + 1, ROLE_NODE);
 ESP_BLE_MESH_MODEL_PUB_DEFINE(light_cli_pub, 2 + 1, ROLE_NODE);
+ESP_BLE_MESH_MODEL_PUB_DEFINE(light_ctl_pub, 2 + 1, ROLE_NODE);
+ESP_BLE_MESH_MODEL_PUB_DEFINE(light_hsl_pub, 2 + 1, ROLE_NODE);
 
 static esp_ble_mesh_model_t root_models[] = {
     ESP_BLE_MESH_MODEL_CFG_SRV(&config_server),
     ESP_BLE_MESH_MODEL_GEN_ONOFF_CLI(&onoff_cli_pub, &onoff_client),
     ESP_BLE_MESH_MODEL_GEN_LEVEL_CLI(&level_cli_pub, &level_client),
     ESP_BLE_MESH_MODEL_LIGHT_LIGHTNESS_CLI(&light_cli_pub, &light_client),
+    ESP_BLE_MESH_MODEL_LIGHT_CTL_CLI(&light_ctl_pub, &ctl_client),
+    ESP_BLE_MESH_MODEL_LIGHT_HSL_CLI(&light_hsl_pub, &hsl_client),
 };
 
 static esp_ble_mesh_elem_t elements[] = {
@@ -340,6 +346,54 @@ void ble_mesh_send_gen_brightness_set(int a_brightness, uint16_t a_addr, esp_mqt
     mesh_info_store(); /* Store proper mesh info */
 }
 
+static esp_err_t example_ble_mesh_set_msg_common(esp_ble_mesh_client_common_param_t *common,
+                                                 uint16_t addr,
+                                                 esp_ble_mesh_model_t *model, uint32_t opcode)
+{
+    if (!common || !addr || !model) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    common->opcode = opcode;
+    common->model = model;
+    common->ctx.net_idx = store.net_idx;
+    common->ctx.app_idx = store.app_idx;
+    common->ctx.addr = addr;
+    common->ctx.send_ttl = 10;
+    common->msg_timeout = 0;
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 2, 0)
+    common->msg_role = ROLE_NODE;
+#endif
+
+    return ESP_OK;
+}
+
+void ble_mesh_send_light_ctl_temp_set(uint16_t temperature, uint16_t addr) {
+    esp_ble_mesh_client_common_param_t common = {0};
+    esp_ble_mesh_light_client_set_state_t set_state = {0};
+
+    example_ble_mesh_set_msg_common(&common, addr, ctl_client.model, ESP_BLE_MESH_MODEL_OP_LIGHT_CTL_TEMPERATURE_SET);
+    set_state.ctl_temperature_set.ctl_temperatrue = temperature;
+
+    if (esp_ble_mesh_light_client_set_state(&common, &set_state)) {
+        ESP_LOGE(TAG, "Failed to send Light CTL Temperature Set");
+    }
+}
+
+void ble_mesh_send_light_hsl_set(uint16_t hue, uint16_t saturation, uint16_t lightness, uint16_t addr) {
+    esp_ble_mesh_client_common_param_t common = {0};
+    esp_ble_mesh_light_client_set_state_t set_state = {0};
+
+    example_ble_mesh_set_msg_common(&common, addr, hsl_client.model, ESP_BLE_MESH_MODEL_OP_LIGHT_HSL_SET);
+    set_state.hsl_set.hsl_hue = hue;
+    set_state.hsl_set.hsl_saturation = saturation;
+    set_state.hsl_set.hsl_lightness = lightness;
+
+    if (esp_ble_mesh_light_client_set_state(&common, &set_state)) {
+        ESP_LOGE(TAG, "Failed to send Light HSL Set");
+    }
+}
+
 static void example_ble_mesh_generic_client_cb(esp_ble_mesh_generic_client_cb_event_t event,
                                                esp_ble_mesh_generic_client_cb_param_t *param)
 {
@@ -484,7 +538,7 @@ typedef struct {
 } MqttMessage;
 
 // Function to create MQTT payload dynamically using cJSON
-char *createPayload(const char *variable1, const char *variable2, const char *variable3) {
+char *createPayload(const char *varName, const char *varTopic, const char *varUniqId) {
     // Create cJSON object dynamically
     cJSON *root = cJSON_CreateObject();
     if (root == NULL) {
@@ -492,29 +546,57 @@ char *createPayload(const char *variable1, const char *variable2, const char *va
         exit(EXIT_FAILURE);
     }
     cJSON *ids = NULL;
+
+    // Add supported color modes array
+    cJSON *supported_color_modes = cJSON_CreateArray();
+    if (supported_color_modes) {
+        cJSON_AddItemToArray(supported_color_modes, cJSON_CreateString("hs"));
+        cJSON_AddItemToArray(supported_color_modes, cJSON_CreateString("color_temp"));
+        cJSON_AddItemToObject(root, "supported_color_modes", supported_color_modes);
+    }
+
     ids = cJSON_CreateArray();
-    cJSON_AddItemToObject(root, "name", cJSON_CreateString(variable1));
-    cJSON_AddItemToObject(root, "~", cJSON_CreateString(variable2));
+    cJSON_AddItemToObject(root, "name", cJSON_CreateString(varName));
+    cJSON_AddItemToObject(root, "~", cJSON_CreateString(varTopic));
     cJSON_AddItemToObject(root, "cmd_t", cJSON_CreateString("~/set"));
     cJSON_AddItemToObject(root, "stat_t", cJSON_CreateString("~/state"));
     cJSON_AddItemToObject(root, "schema", cJSON_CreateString("json"));
     cJSON_AddItemToObject(root, "brightness", cJSON_CreateBool(true));
+    cJSON_AddItemToObject(root, "color_mode", cJSON_CreateBool(true));
+    cJSON_AddItemToObject(root, "brightness", cJSON_CreateBool(true));
     cJSON_AddItemToObject(root, "bri_scl", cJSON_CreateNumber(50));
     cJSON_AddItemToObject(root, "pl_on", cJSON_CreateString("ON"));
     cJSON_AddItemToObject(root, "pl_off", cJSON_CreateString("OFF"));
-    cJSON_AddItemToObject(root, "uniq_id", cJSON_CreateString(variable3));
-    cJSON *dev = cJSON_CreateObject();
+    cJSON_AddItemToObject(root, "uniq_id", cJSON_CreateString(varUniqId));
+
+    // Dynamically concatenate varTopic with the specific suffixes
+    char buffer[256];
     
+    snprintf(buffer, sizeof(buffer), "%s/color_temp", varTopic);
+    cJSON_AddStringToObject(root, "color_temp_command_topic", buffer);
+
+    snprintf(buffer, sizeof(buffer), "%s/hs", varTopic);
+    cJSON_AddStringToObject(root, "hs_command_topic", buffer);
+
+    snprintf(buffer, sizeof(buffer), "%s/color_temp_state", varTopic);
+    cJSON_AddStringToObject(root, "color_temp_state_topic", buffer);
+
+    snprintf(buffer, sizeof(buffer), "%s/hs_state", varTopic);
+    cJSON_AddStringToObject(root, "hs_state_topic", buffer);
+
+    cJSON *dev = cJSON_CreateObject();
+
     cJSON_AddItemToObject(root, "dev", dev);
-    cJSON_AddItemToArray(ids, cJSON_CreateString(variable3));
+    cJSON_AddItemToArray(ids, cJSON_CreateString(varUniqId));
     cJSON_AddItemToObject(dev, "ids", ids);
     cJSON_AddItemToObject(dev, "name", cJSON_CreateString("Lamp"));
 
     char *string = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    
+
     return string;
 }
+
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
@@ -602,6 +684,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     break;                   
                 }
                 // Extract json data
+
+                // TODO : CHECK FOR HSL AND CTL DATA FROM MQTT
+                
                 cJSON *brightness = cJSON_GetObjectItemCaseSensitive(json, "brightness");
                 cJSON *actstate = cJSON_GetObjectItemCaseSensitive(json, "state");
                 //printf("State: %s\n", actstate->valuestring);
@@ -621,7 +706,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 //printf("DATA=%.*s\r\n", event->data_len, event->data); 
                 cJSON_Delete(json);
             }
-            
+                 
 
             if (strncmp("homeassistant/status", event->topic, 20) == 0) 
             {
