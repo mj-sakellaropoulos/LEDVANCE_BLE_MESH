@@ -372,7 +372,7 @@ void ble_mesh_send_light_ctl_temp_set(uint16_t temperature, uint16_t addr) {
     esp_ble_mesh_client_common_param_t common = {0};
     esp_ble_mesh_light_client_set_state_t set_state = {0};
 
-    example_ble_mesh_set_msg_common(&common, addr, ctl_client.model, ESP_BLE_MESH_MODEL_OP_LIGHT_CTL_TEMPERATURE_SET);
+    example_ble_mesh_set_msg_common(&common, addr, ctl_client.model, ESP_BLE_MESH_MODEL_OP_LIGHT_CTL_TEMPERATURE_SET_UNACK);
     set_state.ctl_temperature_set.ctl_temperatrue = temperature;
 
     if (esp_ble_mesh_light_client_set_state(&common, &set_state)) {
@@ -384,7 +384,7 @@ void ble_mesh_send_light_hsl_set(uint16_t hue, uint16_t saturation, uint16_t lig
     esp_ble_mesh_client_common_param_t common = {0};
     esp_ble_mesh_light_client_set_state_t set_state = {0};
 
-    example_ble_mesh_set_msg_common(&common, addr, hsl_client.model, ESP_BLE_MESH_MODEL_OP_LIGHT_HSL_SET);
+    example_ble_mesh_set_msg_common(&common, addr, hsl_client.model, ESP_BLE_MESH_MODEL_OP_LIGHT_HSL_SET_UNACK | ESP_BLE_MESH_MODEL_OP_LIGHT_HSL_HUE_SET_UNACK | ESP_BLE_MESH_MODEL_OP_LIGHT_HSL_SATURATION_SET_UNACK);
     set_state.hsl_set.hsl_hue = hue;
     set_state.hsl_set.hsl_saturation = saturation;
     set_state.hsl_set.hsl_lightness = lightness;
@@ -672,41 +672,66 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 }
             }
             
-           if (setMessage){
-                //parse received json data
+            if (setMessage) {
+                // Parse received JSON data
                 cJSON *json = cJSON_Parse(event->data);
-                if (json == NULL) 
-                {
+                if (json == NULL) {
                     const char *error_ptr = cJSON_GetErrorPtr();
                     if (error_ptr != NULL) {
                         fprintf(stderr, "Error before: %s\n", error_ptr);
-                    } 
-                    break;                   
+                    }
+                    break;
                 }
-                // Extract json data
 
-                // TODO : CHECK FOR HSL AND CTL DATA FROM MQTT
-                
+                // Extract JSON data
                 cJSON *brightness = cJSON_GetObjectItemCaseSensitive(json, "brightness");
                 cJSON *actstate = cJSON_GetObjectItemCaseSensitive(json, "state");
-                //printf("State: %s\n", actstate->valuestring);
+                cJSON *color_temp = cJSON_GetObjectItemCaseSensitive(json, "color_temp");
+                cJSON *hs = cJSON_GetObjectItemCaseSensitive(json, "color");
+
+                bool alreadyTX = false;
+
+                // Handle brightness
                 if (cJSON_IsNumber(brightness)) {
-                    //printf("brightness: %d\n", brightness->valueint);
                     int bright = brightness->valueint;
                     ble_mesh_send_gen_brightness_set(bright, net_addr, client, ha_topic);
+                    alreadyTX = true;
                 }
-                else if(strncmp("ON",actstate->valuestring,2)==0){
-                    ble_mesh_send_gen_onoff_set(1, net_addr);
-                    esp_mqtt_client_publish(client, ha_topic, "{\"state\":\"ON\"}", 0, 0, 0);
+
+                // Handle color temperature
+                if (cJSON_IsNumber(color_temp)) {
+                    uint16_t temperature = (uint16_t)color_temp->valueint;
+                    ble_mesh_send_light_ctl_temp_set(temperature, net_addr);
+                    alreadyTX = true;
                 }
-                else if(strncmp("OFF",actstate->valuestring,3)==0){
-                    ble_mesh_send_gen_onoff_set(0, net_addr);
-                    esp_mqtt_client_publish(client, ha_topic, "{\"state\":\"OFF\"}", 0, 0, 0);
+
+                // Handle HS color
+                if (cJSON_IsArray(hs) && cJSON_GetArraySize(hs) == 2) {
+                    cJSON *hue_item = cJSON_GetArrayItem(hs, 0);
+                    cJSON *saturation_item = cJSON_GetArrayItem(hs, 1);
+                    if (cJSON_IsNumber(hue_item) && cJSON_IsNumber(saturation_item)) {
+                        uint16_t hue = (uint16_t)hue_item->valuedouble;
+                        uint16_t saturation = (uint16_t)saturation_item->valuedouble;
+                        uint16_t lightness = 0xFFFF; // Maximum lightness
+                        ble_mesh_send_light_hsl_set(hue, saturation, lightness, net_addr);
+                        alreadyTX = true;
+                    }
                 }
-                //printf("DATA=%.*s\r\n", event->data_len, event->data); 
+
+                // Handle ON/OFF state
+                if (cJSON_IsString(actstate) && !alreadyTX) {
+                    if (strncmp("ON", actstate->valuestring, 2) == 0) {
+                        ble_mesh_send_gen_onoff_set(1, net_addr);
+                        esp_mqtt_client_publish(client, ha_topic, "{\"state\":\"ON\"}", 0, 0, 0);
+                    } else if (strncmp("OFF", actstate->valuestring, 3) == 0) {
+                        ble_mesh_send_gen_onoff_set(0, net_addr);
+                        esp_mqtt_client_publish(client, ha_topic, "{\"state\":\"OFF\"}", 0, 0, 0);
+                    }
+                }
+
+                // Clean up
                 cJSON_Delete(json);
-            }
-                 
+            }                
 
             if (strncmp("homeassistant/status", event->topic, 20) == 0) 
             {
@@ -721,7 +746,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     // Generate MQTT message for this lamp
                     char topic[100];
                     char config_topic[100];
-                    char payload[500];  // Adjust size as needed
+                    char payload[1000];  // Adjust size as needed
                 
                     // Create unique topic for this lamp (adjust as per your requirement)
                     snprintf(topic, sizeof(topic), "homeassistant/light/%s", lamp_info.name);
